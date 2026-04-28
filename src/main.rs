@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use std::{
     env,
+    fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom, Write},
+    panic::{self, AssertUnwindSafe},
     path::Path,
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
@@ -430,63 +432,68 @@ impl eframe::App for PrinterApp {
 // =========================================================
 
 fn main() -> eframe::Result<()> {
-    let (
-        ui_tx,
-        ui_rx,
-    ) =
+    install_crash_logger();
+
+    log_info("[APP] RBPrinter starting");
+
+    let (ui_tx, ui_rx) =
         mpsc::channel::<WorkerEvent>();
 
-    thread::spawn(
-        move || {
-            service_worker(
-                ui_tx,
+    let worker_ui_tx = ui_tx.clone();
+
+    thread::spawn(move || {
+        log_info("[THREAD] service worker starting");
+
+        let worker_result = panic::catch_unwind(
+            AssertUnwindSafe(|| {
+                service_worker(worker_ui_tx.clone());
+            }),
+        );
+
+        if worker_result.is_err() {
+            log_error("[FATAL] service worker panicked");
+
+            send_status(
+                &worker_ui_tx,
+                PrinterStatus::Error,
+                "Background service crashed. Check rbprinter-crash.log and rbprinter.log.",
             );
-        },
+        }
+    });
+
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+
+        run_and_return: false,
+
+        viewport: egui::ViewportBuilder::default()
+            .with_title("PDF Printer Client")
+            .with_inner_size([500.0, 450.0])
+            .with_min_inner_size([500.0, 450.0])
+            .with_resizable(false),
+
+        ..Default::default()
+    };
+
+    log_info("[APP] starting GUI");
+
+    let result = eframe::run_native(
+        "PDF Printer Client",
+        options,
+        Box::new(move |_cc| {
+            Ok(Box::new(
+                PrinterApp::new(ui_rx),
+            ))
+        }),
     );
 
-    let options =
-        eframe::NativeOptions {
-            viewport:
-            egui::ViewportBuilder::default()
-                .with_title(
-                    "PDF Printer Client",
-                )
-                .with_inner_size(
-                    [
-                        500.0,
-                        450.0,
-                    ],
-                )
-                .with_min_inner_size(
-                    [
-                        500.0,
-                        450.0,
-                    ],
-                )
-                .with_resizable(
-                    false,
-                ),
+    if let Err(err) = &result {
+        log_error(&format!(
+            "[GUI ERROR] {err:?}"
+        ));
+    }
 
-            ..Default::default()
-        };
-
-    eframe::run_native(
-        "PDF Printer Client",
-
-        options,
-
-        Box::new(
-            move |_cc| {
-                Ok(
-                    Box::new(
-                        PrinterApp::new(
-                            ui_rx,
-                        ),
-                    ),
-                )
-            },
-        ),
-    )
+    result
 }
 
 // =========================================================
@@ -591,29 +598,57 @@ fn service_worker(
     let print_ui_tx =
         ui_tx.clone();
 
-    thread::spawn(
-        move || {
-            print_worker(
-                job_rx,
+    let print_panic_ui_tx =
+        print_ui_tx.clone();
 
-                http,
+    thread::spawn(move || {
+        let print_result = panic::catch_unwind(
+            AssertUnwindSafe(|| {
+                print_worker(
+                    job_rx,
+                    http,
+                    print_ui_tx,
+                );
+            }),
+        );
 
-                print_ui_tx,
+        if print_result.is_err() {
+            log_error("[FATAL] print worker panicked");
+
+            send_status(
+                &print_panic_ui_tx,
+                PrinterStatus::Error,
+                "Print worker crashed. Check rbprinter-crash.log and rbprinter.log.",
             );
-        },
-    );
+        }
+    });
 
     // ---------------------------------------------
     // SOCKET.IO
     // ---------------------------------------------
 
-    socket_worker(
-        config,
+    let socket_panic_ui_tx =
+        ui_tx.clone();
 
-        job_tx,
-
-        ui_tx,
+    let socket_result = panic::catch_unwind(
+        AssertUnwindSafe(|| {
+            socket_worker(
+                config,
+                job_tx,
+                socket_panic_ui_tx.clone(),
+            );
+        }),
     );
+
+    if socket_result.is_err() {
+        log_error("[FATAL] socket worker panicked");
+
+        send_status(
+            &ui_tx,
+            PrinterStatus::Error,
+            "Socket worker crashed. Check rbprinter-crash.log and rbprinter.log.",
+        );
+    }
 }
 
 // =========================================================
@@ -680,10 +715,10 @@ fn load_config() -> Result<Config> {
             }
         };
 
-    println!(
+    log_info(&format!(
         "[CONFIG] .env = {}",
         env_path.display(),
-    );
+    ));
 
     dotenvy::from_path(
         &env_path,
@@ -873,20 +908,24 @@ fn socket_worker(
                 }
             };
 
-        println!(
+        log_info(&format!(
             "[SOCKET] Connecting: {}",
             websocket_url,
-        );
+        ));
 
         // ---------------------------------------------
         // CONNECT
         // ---------------------------------------------
+
+        log_info("[SOCKET] calling tungstenite::connect()");
 
         let connection =
             connect(
                 websocket_url
                     .as_str(),
             );
+
+        log_info("[SOCKET] tungstenite::connect() returned");
 
         let (
             mut socket,
@@ -915,10 +954,10 @@ fn socket_worker(
                 }
             };
 
-        println!(
+        log_info(&format!(
             "[SOCKET] HTTP response: {}",
             response.status(),
-        );
+        ));
 
         send_status(
             &ui_tx,
@@ -939,10 +978,10 @@ fn socket_worker(
                         message,
 
                     Err(err) => {
-                        eprintln!(
+                        log_error(&format!(
                             "[SOCKET ERROR] {}",
                             err,
-                        );
+                        ));
 
                         send_status(
                             &ui_tx,
@@ -981,9 +1020,9 @@ fn socket_worker(
                             &ui_tx,
                         )
                     {
-                        eprintln!(
+                        log_error(&format!(
                             "[SOCKET PACKET ERROR] {err:#}"
-                        );
+                        ));
                     }
                 }
 
@@ -1071,9 +1110,7 @@ where
     if packet.starts_with(
         '0',
     ) {
-        println!(
-            "[ENGINE.IO] Session opened"
-        );
+        log_info("[ENGINE.IO] Session opened");
 
         // Root Socket.IO namespace connect packet.
         //
@@ -1091,9 +1128,7 @@ where
                 "Unable to send Socket.IO connect packet",
             )?;
 
-        println!(
-            "[SOCKET TX] 40"
-        );
+        log_info("[SOCKET TX] 40");
 
         return Ok(());
     }
@@ -1159,9 +1194,7 @@ where
     // =====================================================
 
     if packet == "40" {
-        println!(
-            "[SOCKET.IO] Root namespace connected"
-        );
+        log_info("[SOCKET.IO] Root namespace connected");
 
         send_status(
             ui_tx,
@@ -1715,97 +1748,126 @@ fn download_pdf(
 }
 
 // =========================================================
+// LOGGING / CRASH DIAGNOSTICS
+// =========================================================
+
+fn log_file_path(
+    file_name: &str,
+) -> Option<std::path::PathBuf> {
+    let exe_path = env::current_exe().ok()?;
+    let exe_dir = exe_path.parent()?;
+
+    Some(exe_dir.join(file_name))
+}
+
+fn append_to_file(
+    file_name: &str,
+    message: &str,
+) {
+    let Some(path) = log_file_path(file_name) else {
+        return;
+    };
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{:?} {}",
+            std::time::SystemTime::now(),
+            message,
+        );
+    }
+}
+
+fn log_info(
+    message: &str,
+) {
+    println!("{}", message);
+    append_to_file("rbprinter.log", message);
+}
+
+fn log_error(
+    message: &str,
+) {
+    eprintln!("{}", message);
+    append_to_file("rbprinter.log", message);
+}
+
+fn install_crash_logger() {
+    panic::set_hook(Box::new(|panic_info| {
+        let backtrace =
+            std::backtrace::Backtrace::force_capture();
+
+        let message = format!(
+            "[PANIC] {}\nBACKTRACE:\n{}",
+            panic_info,
+            backtrace,
+        );
+
+        eprintln!("{}", message);
+
+        append_to_file(
+            "rbprinter-crash.log",
+            &message,
+        );
+
+        append_to_file(
+            "rbprinter.log",
+            &message,
+        );
+    }));
+}
+
+// =========================================================
 // STATUS
 // =========================================================
 
 fn send_status(
     tx: &Sender<WorkerEvent>,
-
     status: PrinterStatus,
-
     message: impl Into<String>,
 ) {
-    let message =
-        message.into();
+    let message = message.into();
+
+    let prefix = match &status {
+        PrinterStatus::Error => "[ERROR]",
+        PrinterStatus::Disconnected => "[DISCONNECTED]",
+        PrinterStatus::Connected => "[CONNECTED]",
+        PrinterStatus::Waiting => "[WAITING]",
+        PrinterStatus::Connecting => "[CONNECTING]",
+        PrinterStatus::Downloading => "[DOWNLOAD]",
+        PrinterStatus::Printing => "[PRINT]",
+        PrinterStatus::Success => "[SUCCESS]",
+        PrinterStatus::Starting => "[STARTING]",
+    };
+
+    let log_message = format!(
+        "{} {}",
+        prefix,
+        message,
+    );
 
     match &status {
-        PrinterStatus::Error => {
-            eprintln!(
-                "[ERROR] {}",
-                message,
-            );
+        PrinterStatus::Error
+        | PrinterStatus::Disconnected => {
+            log_error(&log_message);
         }
 
-        PrinterStatus::Disconnected => {
-            eprintln!(
-                "[DISCONNECTED] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Connected => {
-            println!(
-                "[CONNECTED] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Waiting => {
-            println!(
-                "[WAITING] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Connecting => {
-            println!(
-                "[CONNECTING] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Downloading => {
-            println!(
-                "[DOWNLOAD] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Printing => {
-            println!(
-                "[PRINT] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Success => {
-            println!(
-                "[SUCCESS] {}",
-                message,
-            );
-        }
-
-        PrinterStatus::Starting => {
-            println!(
-                "[STARTING] {}",
-                message,
-            );
+        _ => {
+            log_info(&log_message);
         }
     }
 
-    let _ =
-        tx.send(
-            WorkerEvent::Status(
-                status,
-            ),
-        );
+    let _ = tx.send(
+        WorkerEvent::Status(status),
+    );
 
-    let _ =
-        tx.send(
-            WorkerEvent::Message(
-                message,
-            ),
-        );
+    let _ = tx.send(
+        WorkerEvent::Message(message),
+    );
 }
 
 // =========================================================
@@ -1813,174 +1875,41 @@ fn send_status(
 // =========================================================
 
 #[cfg(target_os = "windows")]
-fn print_pdf(
-    path: &Path,
-) -> Result<()> {
-    println!(
-        "[PRINT] PDF file: {}",
-        path.display(),
-    );
+fn print_pdf(path: &Path) -> Result<()> {
+    let exe_path = env::current_exe()
+        .context("Unable to determine application path")?;
 
-    // ---------------------------------------------
-    // SumatraPDF next to executable
-    // ---------------------------------------------
+    let exe_dir = exe_path
+        .parent()
+        .context("Unable to determine application directory")?;
 
-    if let Ok(exe_path) =
-        env::current_exe()
-    {
-        if let Some(directory) =
-            exe_path.parent()
-        {
-            let sumatra =
-                directory.join(
-                    "SumatraPDF.exe",
-                );
+    let sumatra = exe_dir.join("SumatraPDF.exe");
 
-            if sumatra.exists() {
-                println!(
-                    "[PRINT] Using SumatraPDF: {}",
-                    sumatra.display(),
-                );
-
-                let status =
-                    Command::new(
-                        &sumatra,
-                    )
-                        .arg(
-                            "-print-to-default",
-                        )
-                        .arg(
-                            "-silent",
-                        )
-                        .arg(
-                            path,
-                        )
-                        .status()
-                        .with_context(
-                            || {
-                                format!(
-                                    "Unable to start {}",
-                                    sumatra.display(),
-                                )
-                            },
-                        )?;
-
-                println!(
-                    "[PRINT] Sumatra exit code: {:?}",
-                    status.code(),
-                );
-
-                if status.success() {
-                    return Ok(());
-                }
-
-                bail!(
-                    "SumatraPDF printing failed with exit code {:?}",
-                    status.code(),
-                );
-            }
-        }
-    }
-
-    // ---------------------------------------------
-    // SumatraPDF from PATH
-    // ---------------------------------------------
-
-    println!(
-        "[PRINT] Checking SumatraPDF in PATH..."
-    );
-
-    match Command::new(
-        "SumatraPDF.exe",
-    )
-        .arg(
-            "-print-to-default",
-        )
-        .arg(
-            "-silent",
-        )
-        .arg(
-            path,
-        )
-        .status()
-    {
-        Ok(status)
-        if status.success() =>
-            {
-                return Ok(());
-            }
-
-        Ok(status) => {
-            eprintln!(
-                "[PRINT] Sumatra in PATH failed: {:?}",
-                status.code(),
-            );
-        }
-
-        Err(err)
-        if err.kind()
-            == io::ErrorKind::NotFound =>
-            {
-                println!(
-                    "[PRINT] SumatraPDF not found"
-                );
-            }
-
-        Err(err) => {
-            return Err(
-                err.into(),
-            );
-        }
-    }
-
-    // ---------------------------------------------
-    // Windows Print verb fallback
-    // ---------------------------------------------
-
-    println!(
-        "[PRINT] Using Windows Print shell verb"
-    );
-
-    let file =
-        path
-            .to_string_lossy()
-            .replace(
-                '\'',
-                "''",
-            );
-
-    let command =
-        format!(
-            "Start-Process -FilePath '{}' -Verb Print -Wait",
-            file,
+    if !sumatra.exists() {
+        bail!(
+            "SumatraPDF.exe not found at {}",
+            sumatra.display()
         );
+    }
 
-    let status =
-        Command::new(
-            "powershell.exe",
-        )
-            .arg(
-                "-NoProfile",
-            )
-            .arg(
-                "-NonInteractive",
-            )
-            .arg(
-                "-Command",
-            )
-            .arg(
-                command,
-            )
-            .status()
-            .context(
-                "Unable to invoke Windows PDF print command",
-            )?;
+    println!("[PRINT] PDF: {}", path.display());
+    println!("[PRINT] Sending to Windows default printer");
+
+    let status = Command::new(&sumatra)
+        .arg("-print-to-default")
+        .arg("-silent")
+        .arg(path)
+        .status()
+        .context("Unable to start SumatraPDF")?;
 
     if !status.success() {
         bail!(
-            "Windows PDF printing failed"
+            "Printing failed. SumatraPDF exit code: {:?}",
+            status.code()
         );
     }
+
+    println!("[PRINT] PDF submitted to default printer");
 
     Ok(())
 }
