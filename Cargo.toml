@@ -1,0 +1,16 @@
+[package]
+name = "rbrprinter"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+eframe = "0.36.1"
+reqwest = { version = "0.13", features = ["blocking"] }
+serde_json = "1"
+tempfile = "3"
+tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+url = "2"
+urlencoding = "2"
