@@ -5,6 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use eframe::egui;
+use lopdf::{Dictionary, Document, Object, Stream};
 use reqwest::blocking::Client;
 use serde_json::Value;
 
@@ -31,6 +32,13 @@ use url::Url;
 const MAX_PDF_SIZE: u64 = 100 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+// Thermal paper geometry.
+// The physical roll is 76 mm wide. We reserve 2.5 mm on both sides,
+// so the source PDF content is uniformly scaled to a 71 mm content area.
+const PAPER_WIDTH_MM: f64 = 76.0;
+const SIDE_MARGIN_MM: f64 = 2.5;
+const CONTENT_WIDTH_MM: f64 = PAPER_WIDTH_MM - (SIDE_MARGIN_MM * 2.0);
 
 // =========================================================
 // CONFIGURATION
@@ -1546,8 +1554,27 @@ fn process_print_job(
         "Sending PDF to default printer...",
     );
 
+    // Prepare a temporary receipt PDF that is exactly 76 mm wide,
+    // keeps 2.5 mm on the left and right, and preserves variable height.
+    let prepared_pdf =
+        prepare_receipt_pdf(
+            pdf.path(),
+        )?;
+
+    println!(
+        "[PRINT] Prepared PDF: {}",
+        prepared_pdf.file.path().display(),
+    );
+
+    println!(
+        "[PRINT] Paper: {:.2} mm x {:.2} mm",
+        PAPER_WIDTH_MM,
+        prepared_pdf.paper_height_mm,
+    );
+
     print_pdf(
-        pdf.path(),
+        prepared_pdf.file.path(),
+        prepared_pdf.paper_height_mm,
     )?;
 
     // Keep temporary file around briefly for the spooler.
@@ -1558,6 +1585,424 @@ fn process_print_job(
     );
 
     Ok(())
+}
+
+// =========================================================
+// PREPARE RECEIPT PDF
+// =========================================================
+
+fn pdf_number_to_f64(
+    object: &Object,
+) -> Result<f64> {
+    match object {
+        Object::Integer(value) =>
+            Ok(*value as f64),
+
+        Object::Real(value) =>
+            Ok(*value as f64),
+
+        _ =>
+            bail!(
+                "PDF page box contains a non-numeric value"
+            ),
+    }
+}
+
+fn get_inherited_page_value<'a>(
+    document: &'a Document,
+    start_id: lopdf::ObjectId,
+    key: &[u8],
+) -> Option<&'a Object> {
+    let mut current_id =
+        Some(start_id);
+
+    while let Some(object_id) =
+        current_id
+    {
+        let dictionary = document
+            .get_object(object_id)
+            .ok()?
+            .as_dict()
+            .ok()?;
+
+        if let Ok(value) =
+            dictionary.get(key)
+        {
+            return Some(value);
+        }
+
+        current_id = dictionary
+            .get(b"Parent")
+            .ok()
+            .and_then(
+                |object| object
+                    .as_reference()
+                    .ok(),
+            );
+    }
+
+    None
+}
+
+fn read_page_box(
+    document: &Document,
+    page_id: lopdf::ObjectId,
+) -> Result<(f64, f64, f64, f64)> {
+    // CropBox and MediaBox may be inherited from the page tree.
+    // Prefer CropBox because it represents the visible page area.
+    let page_box_object =
+        get_inherited_page_value(
+            document,
+            page_id,
+            b"CropBox",
+        )
+            .or_else(
+                || {
+                    get_inherited_page_value(
+                        document,
+                        page_id,
+                        b"MediaBox",
+                    )
+                },
+            )
+            .context(
+                "PDF page has no CropBox or MediaBox",
+            )?;
+
+    let page_box = page_box_object
+        .as_array()
+        .context("PDF page box is not an array")?;
+
+    if page_box.len() != 4 {
+        bail!(
+            "PDF page box must contain exactly 4 values"
+        );
+    }
+
+    let x0 = pdf_number_to_f64(&page_box[0])?;
+    let y0 = pdf_number_to_f64(&page_box[1])?;
+    let x1 = pdf_number_to_f64(&page_box[2])?;
+    let y1 = pdf_number_to_f64(&page_box[3])?;
+
+    Ok((x0, y0, x1, y1))
+}
+
+fn append_original_contents(
+    document: &mut Document,
+    original_contents: Option<Object>,
+    new_contents: &mut Vec<Object>,
+) -> Result<()> {
+    let Some(contents) = original_contents else {
+        return Ok(());
+    };
+
+    match contents {
+        Object::Reference(object_id) => {
+            new_contents.push(
+                Object::Reference(object_id),
+            );
+        }
+
+        Object::Array(items) => {
+            for item in items {
+                match item {
+                    Object::Reference(object_id) => {
+                        new_contents.push(
+                            Object::Reference(object_id),
+                        );
+                    }
+
+                    Object::Stream(stream) => {
+                        let object_id =
+                            document.add_object(stream);
+
+                        new_contents.push(
+                            Object::Reference(object_id),
+                        );
+                    }
+
+                    _ => {
+                        bail!(
+                            "Unsupported PDF Contents array item"
+                        );
+                    }
+                }
+            }
+        }
+
+        Object::Stream(stream) => {
+            let object_id =
+                document.add_object(stream);
+
+            new_contents.push(
+                Object::Reference(object_id),
+            );
+        }
+
+        Object::Null => {}
+
+        _ => {
+            bail!(
+                "Unsupported PDF Contents object"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+struct PreparedReceiptPdf {
+    file: NamedTempFile,
+    paper_height_mm: f64,
+}
+
+fn prepare_receipt_pdf(
+    source_path: &Path,
+) -> Result<PreparedReceiptPdf> {
+    let mut document =
+        Document::load(source_path)
+            .context(
+                "Unable to open PDF for receipt margin preparation",
+            )?;
+
+    let pages = document.get_pages();
+
+    if pages.is_empty() {
+        bail!(
+            "PDF contains no pages"
+        );
+    }
+
+    // Thermal receipt jobs must be one continuous page because the printer
+    // needs one exact custom paper height for the job.
+    if pages.len() != 1 {
+        bail!(
+            "Receipt PDF must contain exactly one page; found {} pages",
+            pages.len(),
+        );
+    }
+
+    let paper_width_pt =
+        PAPER_WIDTH_MM * 72.0 / 25.4;
+
+    let content_width_pt =
+        CONTENT_WIDTH_MM * 72.0 / 25.4;
+
+    let mut prepared_height_mm = 0.0_f64;
+
+    for (_page_number, page_id) in pages {
+        let (
+            x0,
+            y0,
+            x1,
+            y1,
+        ) = read_page_box(
+            &document,
+            page_id,
+        )?;
+
+        let source_width_pt =
+            (x1 - x0).abs();
+
+        let source_height_pt =
+            (y1 - y0).abs();
+
+        if source_width_pt <= 0.0
+            || source_height_pt <= 0.0
+        {
+            bail!(
+                "PDF page has invalid dimensions"
+            );
+        }
+
+        // Uniformly scale only when necessary. The content is never enlarged.
+        // A normal 76 mm-ish receipt is reduced just enough to leave at least
+        // 2.5 mm on both sides. Narrower receipts stay at 100% and are centered.
+        let scale =
+            (content_width_pt
+                / source_width_pt)
+                .min(1.0);
+
+        let scaled_width_pt =
+            source_width_pt
+                * scale;
+
+        let output_height_pt =
+            source_height_pt
+                * scale;
+
+        prepared_height_mm =
+            output_height_pt * 25.4 / 72.0;
+
+        let actual_left_margin_pt =
+            (paper_width_pt - scaled_width_pt)
+                / 2.0;
+
+        let translate_x =
+            actual_left_margin_pt
+                - (x0 * scale);
+
+        let translate_y =
+            -(y0 * scale);
+
+        let prefix = format!(
+            "q\n{:.8} 0 0 {:.8} {:.8} {:.8} cm\n",
+            scale,
+            scale,
+            translate_x,
+            translate_y,
+        );
+
+        let prefix_id =
+            document.add_object(
+                Stream::new(
+                    Dictionary::new(),
+                    prefix.into_bytes(),
+                ),
+            );
+
+        let suffix_id =
+            document.add_object(
+                Stream::new(
+                    Dictionary::new(),
+                    b"\nQ\n".to_vec(),
+                ),
+            );
+
+        let original_contents = {
+            let page = document
+                .get_object(page_id)
+                .context(
+                    "Unable to read PDF page contents",
+                )?
+                .as_dict()
+                .context(
+                    "PDF page object is not a dictionary",
+                )?;
+
+            page.get(b"Contents")
+                .ok()
+                .cloned()
+        };
+
+        let mut new_contents = vec![
+            Object::Reference(prefix_id),
+        ];
+
+        append_original_contents(
+            &mut document,
+            original_contents,
+            &mut new_contents,
+        )?;
+
+        new_contents.push(
+            Object::Reference(suffix_id),
+        );
+
+        let page = document
+            .get_object_mut(page_id)
+            .context(
+                "Unable to update PDF page",
+            )?
+            .as_dict_mut()
+            .context(
+                "PDF page object is not a dictionary",
+            )?;
+
+        let new_page_box =
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(
+                    paper_width_pt as f32,
+                ),
+                Object::Real(
+                    output_height_pt as f32,
+                ),
+            ]);
+
+        page.set(
+            "MediaBox",
+            new_page_box.clone(),
+        );
+
+        page.set(
+            "CropBox",
+            new_page_box,
+        );
+
+        page.set(
+            "Contents",
+            Object::Array(new_contents),
+        );
+
+        // The content stream now has the final orientation and position.
+        // Remove page rotation so the printer does not rotate it again.
+        page.set(
+            "Rotate",
+            Object::Integer(0),
+        );
+
+        println!(
+            "[PDF PREP] Source: {:.2} mm x {:.2} mm",
+            source_width_pt * 25.4 / 72.0,
+            source_height_pt * 25.4 / 72.0,
+        );
+
+        println!(
+            "[PDF PREP] Output: {:.2} mm x {:.2} mm, scale {:.4}",
+            PAPER_WIDTH_MM,
+            output_height_pt * 25.4 / 72.0,
+            scale,
+        );
+    }
+
+    // Remove unused objects after replacing page content streams.
+    document.prune_objects();
+
+    let mut prepared =
+        Builder::new()
+            .prefix(
+                "rbprinter_prepared_",
+            )
+            .suffix(
+                ".pdf",
+            )
+            .tempfile()
+            .context(
+                "Unable to create prepared PDF temporary file",
+            )?;
+
+    document
+        .save_to(
+            prepared.as_file_mut(),
+        )
+        .context(
+            "Unable to save prepared receipt PDF",
+        )?;
+
+    prepared
+        .as_file_mut()
+        .flush()
+        .context(
+            "Unable to flush prepared receipt PDF",
+        )?;
+
+    prepared
+        .as_file_mut()
+        .seek(
+            SeekFrom::Start(0),
+        )
+        .context(
+            "Unable to rewind prepared receipt PDF",
+        )?;
+
+    Ok(
+        PreparedReceiptPdf {
+            file: prepared,
+            paper_height_mm: prepared_height_mm,
+        },
+    )
 }
 
 // =========================================================
@@ -1875,7 +2320,10 @@ fn send_status(
 // =========================================================
 
 #[cfg(target_os = "windows")]
-fn print_pdf(path: &Path) -> Result<()> {
+fn print_pdf(
+    path: &Path,
+    paper_height_mm: f64,
+) -> Result<()> {
     let exe_path = env::current_exe()
         .context("Unable to determine application path")?;
 
@@ -1895,8 +2343,24 @@ fn print_pdf(path: &Path) -> Result<()> {
     println!("[PRINT] PDF: {}", path.display());
     println!("[PRINT] Sending to Windows default printer");
 
+    // The prepared PDF already contains the 2.5 mm margins.
+    // Pass the exact 76 mm x dynamic-height paper size to Sumatra so the
+    // thermal driver does not fall back to a fixed/long page size.
+    let print_settings = format!(
+        "noscale,center,paper={:.2}mm x {:.2}mm,disable-auto-rotation,ignore-pdf-print-settings",
+        PAPER_WIDTH_MM,
+        paper_height_mm,
+    );
+
+    println!(
+        "[PRINT] Settings: {}",
+        print_settings,
+    );
+
     let status = Command::new(&sumatra)
         .arg("-print-to-default")
+        .arg("-print-settings")
+        .arg(&print_settings)
         .arg("-silent")
         .arg(path)
         .status()
@@ -1921,6 +2385,7 @@ fn print_pdf(path: &Path) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn print_pdf(
     path: &Path,
+    _paper_height_mm: f64,
 ) -> Result<()> {
     let status =
         Command::new(
@@ -1950,6 +2415,7 @@ fn print_pdf(
 #[cfg(target_os = "macos")]
 fn print_pdf(
     path: &Path,
+    _paper_height_mm: f64,
 ) -> Result<()> {
     let status =
         Command::new(
@@ -1983,6 +2449,7 @@ fn print_pdf(
 )))]
 fn print_pdf(
     _path: &Path,
+    _paper_height_mm: f64,
 ) -> Result<()> {
     bail!(
         "Unsupported operating system"
