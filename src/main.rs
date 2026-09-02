@@ -11,12 +11,15 @@ use serde_json::Value;
 
 use std::{
     env,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     panic::{self, AssertUnwindSafe},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, RwLock,
+    },
     thread,
     time::Duration,
 };
@@ -33,21 +36,68 @@ const MAX_PDF_SIZE: u64 = 100 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-// Thermal paper geometry.
-// The physical roll is 76 mm wide. We reserve 2.5 mm on both sides,
-// so the source PDF content is uniformly scaled to a 71 mm content area.
-const PAPER_WIDTH_MM: f64 = 76.0;
-const SIDE_MARGIN_MM: f64 = 2.5;
-const CONTENT_WIDTH_MM: f64 = PAPER_WIDTH_MM - (SIDE_MARGIN_MM * 2.0);
+// Default thermal paper geometry. These can be edited in the UI and
+// are persisted in the .env file.
+const DEFAULT_PAPER_WIDTH_MM: f64 = 76.0;
+const DEFAULT_SIDE_MARGIN_MM: f64 = 2.5;
+
+const ENV_PAPER_WIDTH_MM: &str = "PAPER_WIDTH_MM";
+const ENV_SIDE_MARGIN_MM: &str = "SIDE_MARGIN_MM";
 
 // =========================================================
 // CONFIGURATION
 // =========================================================
 
+#[derive(Clone, Copy, Debug)]
+struct PrintSettings {
+    paper_width_mm: f64,
+    side_margin_mm: f64,
+}
+
+impl Default for PrintSettings {
+    fn default() -> Self {
+        Self {
+            paper_width_mm: DEFAULT_PAPER_WIDTH_MM,
+            side_margin_mm: DEFAULT_SIDE_MARGIN_MM,
+        }
+    }
+}
+
+impl PrintSettings {
+    fn content_width_mm(&self) -> f64 {
+        self.paper_width_mm - (self.side_margin_mm * 2.0)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.paper_width_mm.is_finite()
+            || self.paper_width_mm <= 0.0
+        {
+            bail!("Paper width must be greater than 0 mm");
+        }
+
+        if !self.side_margin_mm.is_finite()
+            || self.side_margin_mm < 0.0
+        {
+            bail!("Side margin cannot be negative");
+        }
+
+        if self.content_width_mm() <= 0.0 {
+            bail!(
+                "Side margin is too large for a {:.2} mm paper width",
+                self.paper_width_mm,
+            );
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     socket_server: String,
     socket_print_event: String,
+    env_path: PathBuf,
+    print_settings: PrintSettings,
 }
 
 // =========================================================
@@ -77,6 +127,10 @@ enum WorkerEvent {
     SocketEvent(String),
     Url(String),
     Message(String),
+    PrintSettingsLoaded {
+        settings: PrintSettings,
+        env_path: PathBuf,
+    },
 }
 
 // =========================================================
@@ -102,6 +156,16 @@ struct PrinterApp {
 
     message: String,
 
+    paper_width_mm: f64,
+
+    side_margin_mm: f64,
+
+    env_path: Option<PathBuf>,
+
+    settings_message: String,
+
+    print_settings: Arc<RwLock<PrintSettings>>,
+
     rx: Receiver<WorkerEvent>,
 }
 
@@ -112,7 +176,14 @@ struct PrinterApp {
 impl PrinterApp {
     fn new(
         rx: Receiver<WorkerEvent>,
+        print_settings: Arc<RwLock<PrintSettings>>,
     ) -> Self {
+        let initial_settings =
+            print_settings
+                .read()
+                .map(|settings| *settings)
+                .unwrap_or_default();
+
         Self {
             status: PrinterStatus::Starting,
 
@@ -125,6 +196,19 @@ impl PrinterApp {
             message:
             "Starting application..."
                 .to_string(),
+
+            paper_width_mm:
+            initial_settings.paper_width_mm,
+
+            side_margin_mm:
+            initial_settings.side_margin_mm,
+
+            env_path: None,
+
+            settings_message:
+            String::new(),
+
+            print_settings,
 
             rx,
         }
@@ -170,6 +254,26 @@ impl PrinterApp {
                 ) => {
                     self.message =
                         message;
+                }
+
+                WorkerEvent::PrintSettingsLoaded {
+                    settings,
+                    env_path,
+                } => {
+                    self.paper_width_mm =
+                        settings.paper_width_mm;
+
+                    self.side_margin_mm =
+                        settings.side_margin_mm;
+
+                    self.env_path =
+                        Some(env_path);
+
+                    if let Ok(mut current) =
+                        self.print_settings.write()
+                    {
+                        *current = settings;
+                    }
                 }
             }
         }
@@ -417,6 +521,163 @@ impl eframe::App for PrinterApp {
                     ui.separator();
 
                     ui.add_space(
+                        12.0,
+                    );
+
+                    // -----------------------------
+                    // PRINT LAYOUT SETTINGS
+                    // -----------------------------
+
+                    ui.label(
+                        egui::RichText::new(
+                            "Print Layout Settings",
+                        )
+                            .strong(),
+                    );
+
+                    ui.add_space(6.0);
+
+                    egui::Grid::new(
+                        "print_layout_settings_grid",
+                    )
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(
+                            ui,
+                            |ui| {
+                                ui.label("Paper width");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.paper_width_mm,
+                                    )
+                                        .speed(0.1)
+                                        .suffix(" mm"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Side margin");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.side_margin_mm,
+                                    )
+                                        .speed(0.1)
+                                        .suffix(" mm"),
+                                );
+                                ui.end_row();
+                            },
+                        );
+
+                    let content_width_mm =
+                        self.paper_width_mm
+                            - (self.side_margin_mm * 2.0);
+
+                    ui.small(
+                        format!(
+                            "Content width: {:.2} mm",
+                            content_width_mm.max(0.0),
+                        ),
+                    );
+
+                    if let Some(env_path) =
+                        &self.env_path
+                    {
+                        ui.small(
+                            format!(
+                                "Saved in: {}",
+                                env_path.display(),
+                            ),
+                        );
+                    }
+
+                    ui.add_space(6.0);
+
+                    ui.horizontal(
+                        |ui| {
+                            if ui
+                                .button("Save Settings")
+                                .clicked()
+                            {
+                                let settings =
+                                    PrintSettings {
+                                        paper_width_mm:
+                                        self.paper_width_mm,
+                                        side_margin_mm:
+                                        self.side_margin_mm,
+                                    };
+
+                                match settings.validate() {
+                                    Err(err) => {
+                                        self.settings_message =
+                                            format!(
+                                                "Invalid settings: {err}",
+                                            );
+                                    }
+
+                                    Ok(()) => {
+                                        if let Some(env_path) =
+                                            self.env_path.as_ref()
+                                        {
+                                            match save_print_settings_to_env(
+                                                env_path,
+                                                settings,
+                                            ) {
+                                                Ok(()) => {
+                                                    if let Ok(mut current) =
+                                                        self.print_settings.write()
+                                                    {
+                                                        *current = settings;
+                                                    }
+
+                                                    self.settings_message =
+                                                        format!(
+                                                            "Saved: {:.2} mm paper, {:.2} mm side margin",
+                                                            settings.paper_width_mm,
+                                                            settings.side_margin_mm,
+                                                        );
+                                                }
+
+                                                Err(err) => {
+                                                    self.settings_message =
+                                                        format!(
+                                                            "Unable to save settings: {err:#}",
+                                                        );
+                                                }
+                                            }
+                                        } else {
+                                            self.settings_message =
+                                                "Configuration is not loaded yet."
+                                                    .to_string();
+                                        }
+                                    }
+                                }
+                            }
+
+                            if ui
+                                .button("Reset 76 / 2.5")
+                                .clicked()
+                            {
+                                self.paper_width_mm =
+                                    DEFAULT_PAPER_WIDTH_MM;
+
+                                self.side_margin_mm =
+                                    DEFAULT_SIDE_MARGIN_MM;
+                            }
+                        },
+                    );
+
+                    if !self.settings_message.is_empty() {
+                        ui.small(
+                            &self.settings_message,
+                        );
+                    }
+
+                    ui.add_space(
+                        12.0,
+                    );
+
+                    ui.separator();
+
+                    ui.add_space(
                         8.0,
                     );
 
@@ -447,14 +708,27 @@ fn main() -> eframe::Result<()> {
     let (ui_tx, ui_rx) =
         mpsc::channel::<WorkerEvent>();
 
+    let print_settings =
+        Arc::new(
+            RwLock::new(
+                PrintSettings::default(),
+            ),
+        );
+
     let worker_ui_tx = ui_tx.clone();
+
+    let worker_print_settings =
+        print_settings.clone();
 
     thread::spawn(move || {
         log_info("[THREAD] service worker starting");
 
         let worker_result = panic::catch_unwind(
             AssertUnwindSafe(|| {
-                service_worker(worker_ui_tx.clone());
+                service_worker(
+                    worker_ui_tx.clone(),
+                    worker_print_settings.clone(),
+                );
             }),
         );
 
@@ -476,8 +750,8 @@ fn main() -> eframe::Result<()> {
 
         viewport: egui::ViewportBuilder::default()
             .with_title("PDF Printer Client")
-            .with_inner_size([500.0, 450.0])
-            .with_min_inner_size([500.0, 450.0])
+            .with_inner_size([520.0, 650.0])
+            .with_min_inner_size([520.0, 650.0])
             .with_resizable(false),
 
         ..Default::default()
@@ -490,7 +764,10 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |_cc| {
             Ok(Box::new(
-                PrinterApp::new(ui_rx),
+                PrinterApp::new(
+                    ui_rx,
+                    print_settings.clone(),
+                ),
             ))
         }),
     );
@@ -510,6 +787,7 @@ fn main() -> eframe::Result<()> {
 
 fn service_worker(
     ui_tx: Sender<WorkerEvent>,
+    print_settings: Arc<RwLock<PrintSettings>>,
 ) {
     send_status(
         &ui_tx,
@@ -561,6 +839,23 @@ fn service_worker(
             ),
         );
 
+    if let Ok(mut current) =
+        print_settings.write()
+    {
+        *current =
+            config.print_settings;
+    }
+
+    let _ =
+        ui_tx.send(
+            WorkerEvent::PrintSettingsLoaded {
+                settings:
+                config.print_settings,
+                env_path:
+                config.env_path.clone(),
+            },
+        );
+
     // ---------------------------------------------
     // HTTP CLIENT
     // ---------------------------------------------
@@ -609,6 +904,9 @@ fn service_worker(
     let print_panic_ui_tx =
         print_ui_tx.clone();
 
+    let print_worker_settings =
+        print_settings.clone();
+
     thread::spawn(move || {
         let print_result = panic::catch_unwind(
             AssertUnwindSafe(|| {
@@ -616,6 +914,7 @@ fn service_worker(
                     job_rx,
                     http,
                     print_ui_tx,
+                    print_worker_settings,
                 );
             }),
         );
@@ -797,13 +1096,188 @@ fn load_config() -> Result<Config> {
                 },
             );
 
+    let paper_width_mm =
+        read_env_f64(
+            ENV_PAPER_WIDTH_MM,
+            DEFAULT_PAPER_WIDTH_MM,
+        )?;
+
+    let side_margin_mm =
+        read_env_f64(
+            ENV_SIDE_MARGIN_MM,
+            DEFAULT_SIDE_MARGIN_MM,
+        )?;
+
+    let print_settings =
+        PrintSettings {
+            paper_width_mm,
+            side_margin_mm,
+        };
+
+    print_settings.validate()?;
+
+    log_info(
+        &format!(
+            "[CONFIG] print layout = {:.2} mm paper / {:.2} mm margins / {:.2} mm content",
+            print_settings.paper_width_mm,
+            print_settings.side_margin_mm,
+            print_settings.content_width_mm(),
+        ),
+    );
+
     Ok(
         Config {
             socket_server,
 
             socket_print_event,
+
+            env_path,
+
+            print_settings,
         },
     )
+}
+
+// =========================================================
+// PRINT SETTINGS / .ENV
+// =========================================================
+
+fn read_env_f64(
+    key: &str,
+    default_value: f64,
+) -> Result<f64> {
+    let value =
+        match env::var(key) {
+            Ok(value) => value,
+            Err(_) => return Ok(default_value),
+        };
+
+    let value = value.trim();
+
+    if value.is_empty() {
+        return Ok(default_value);
+    }
+
+    value
+        .parse::<f64>()
+        .with_context(
+            || {
+                format!(
+                    "{key} must be a number, got '{value}'",
+                )
+            },
+        )
+}
+
+fn save_print_settings_to_env(
+    env_path: &Path,
+    settings: PrintSettings,
+) -> Result<()> {
+    settings.validate()?;
+
+    let existing =
+        fs::read_to_string(env_path)
+            .with_context(
+                || {
+                    format!(
+                        "Unable to read {}",
+                        env_path.display(),
+                    )
+                },
+            )?;
+
+    let mut lines:
+        Vec<String> =
+        existing
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+    set_env_line(
+        &mut lines,
+        ENV_PAPER_WIDTH_MM,
+        &format!(
+            "{:.2}",
+            settings.paper_width_mm,
+        ),
+    );
+
+    set_env_line(
+        &mut lines,
+        ENV_SIDE_MARGIN_MM,
+        &format!(
+            "{:.2}",
+            settings.side_margin_mm,
+        ),
+    );
+
+    let mut output =
+        lines.join("\n");
+
+    output.push('\n');
+
+    fs::write(
+        env_path,
+        output,
+    )
+        .with_context(
+            || {
+                format!(
+                    "Unable to write {}",
+                    env_path.display(),
+                )
+            },
+        )?;
+
+    log_info(
+        &format!(
+            "[CONFIG] Saved print settings to {}",
+            env_path.display(),
+        ),
+    );
+
+    Ok(())
+}
+
+fn set_env_line(
+    lines: &mut Vec<String>,
+    key: &str,
+    value: &str,
+) {
+    let mut found = false;
+
+    for line in lines.iter_mut() {
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some((existing_key, _)) =
+            trimmed.split_once('=')
+        else {
+            continue;
+        };
+
+        if existing_key.trim() == key {
+            if !found {
+                *line =
+                    format!(
+                        "{key}={value}",
+                    );
+
+                found = true;
+            }
+        }
+    }
+
+    if !found {
+        lines.push(
+            format!(
+                "{key}={value}",
+            ),
+        );
+    }
 }
 
 // =========================================================
@@ -1437,12 +1911,20 @@ fn print_worker(
     http_client: Client,
 
     ui_tx: Sender<WorkerEvent>,
+
+    print_settings: Arc<RwLock<PrintSettings>>,
 ) {
     for job in job_rx {
         println!(
             "[PRINT] Processing {}",
             job.url,
         );
+
+        let settings =
+            print_settings
+                .read()
+                .map(|settings| *settings)
+                .unwrap_or_default();
 
         let result =
             process_print_job(
@@ -1451,6 +1933,8 @@ fn print_worker(
                 &job.url,
 
                 &ui_tx,
+
+                settings,
             );
 
         match result {
@@ -1512,6 +1996,8 @@ fn process_print_job(
     pdf_url: &str,
 
     ui_tx: &Sender<WorkerEvent>,
+
+    print_settings: PrintSettings,
 ) -> Result<()> {
     // ---------------------------------------------
     // DOWNLOAD
@@ -1554,11 +2040,12 @@ fn process_print_job(
         "Sending PDF to default printer...",
     );
 
-    // Prepare a temporary receipt PDF that is exactly 76 mm wide,
-    // keeps 2.5 mm on the left and right, and preserves variable height.
+    // Prepare a temporary receipt PDF using the current UI settings.
+    // Width/margins are configurable; height remains dynamic per PDF.
     let prepared_pdf =
         prepare_receipt_pdf(
             pdf.path(),
+            print_settings,
         )?;
 
     println!(
@@ -1568,13 +2055,14 @@ fn process_print_job(
 
     println!(
         "[PRINT] Paper: {:.2} mm x {:.2} mm",
-        PAPER_WIDTH_MM,
+        print_settings.paper_width_mm,
         prepared_pdf.paper_height_mm,
     );
 
     print_pdf(
         prepared_pdf.file.path(),
         prepared_pdf.paper_height_mm,
+        print_settings.paper_width_mm,
     )?;
 
     // Keep temporary file around briefly for the spooler.
@@ -1758,7 +2246,9 @@ struct PreparedReceiptPdf {
 
 fn prepare_receipt_pdf(
     source_path: &Path,
+    settings: PrintSettings,
 ) -> Result<PreparedReceiptPdf> {
+    settings.validate()?;
     let mut document =
         Document::load(source_path)
             .context(
@@ -1783,10 +2273,10 @@ fn prepare_receipt_pdf(
     }
 
     let paper_width_pt =
-        PAPER_WIDTH_MM * 72.0 / 25.4;
+        settings.paper_width_mm * 72.0 / 25.4;
 
     let content_width_pt =
-        CONTENT_WIDTH_MM * 72.0 / 25.4;
+        settings.content_width_mm() * 72.0 / 25.4;
 
     let mut prepared_height_mm = 0.0_f64;
 
@@ -1816,8 +2306,8 @@ fn prepare_receipt_pdf(
         }
 
         // Uniformly scale only when necessary. The content is never enlarged.
-        // A normal 76 mm-ish receipt is reduced just enough to leave at least
-        // 2.5 mm on both sides. Narrower receipts stay at 100% and are centered.
+        // The source is reduced only when needed to fit the configured side margins.
+        // Narrower receipts stay at 100% and are centered.
         let scale =
             (content_width_pt
                 / source_width_pt)
@@ -1951,7 +2441,7 @@ fn prepare_receipt_pdf(
 
         println!(
             "[PDF PREP] Output: {:.2} mm x {:.2} mm, scale {:.4}",
-            PAPER_WIDTH_MM,
+            settings.paper_width_mm,
             output_height_pt * 25.4 / 72.0,
             scale,
         );
@@ -2323,6 +2813,7 @@ fn send_status(
 fn print_pdf(
     path: &Path,
     paper_height_mm: f64,
+    paper_width_mm: f64,
 ) -> Result<()> {
     let exe_path = env::current_exe()
         .context("Unable to determine application path")?;
@@ -2343,12 +2834,12 @@ fn print_pdf(
     println!("[PRINT] PDF: {}", path.display());
     println!("[PRINT] Sending to Windows default printer");
 
-    // The prepared PDF already contains the 2.5 mm margins.
-    // Pass the exact 76 mm x dynamic-height paper size to Sumatra so the
+    // The prepared PDF already contains the configured margins.
+    // Pass the configured width plus dynamic height to Sumatra so the
     // thermal driver does not fall back to a fixed/long page size.
     let print_settings = format!(
         "noscale,center,paper={:.2}mm x {:.2}mm,disable-auto-rotation,ignore-pdf-print-settings",
-        PAPER_WIDTH_MM,
+        paper_width_mm,
         paper_height_mm,
     );
 
@@ -2386,6 +2877,7 @@ fn print_pdf(
 fn print_pdf(
     path: &Path,
     _paper_height_mm: f64,
+    _paper_width_mm: f64,
 ) -> Result<()> {
     let status =
         Command::new(
@@ -2416,6 +2908,7 @@ fn print_pdf(
 fn print_pdf(
     path: &Path,
     _paper_height_mm: f64,
+    _paper_width_mm: f64,
 ) -> Result<()> {
     let status =
         Command::new(
@@ -2450,6 +2943,7 @@ fn print_pdf(
 fn print_pdf(
     _path: &Path,
     _paper_height_mm: f64,
+    _paper_width_mm: f64,
 ) -> Result<()> {
     bail!(
         "Unsupported operating system"
