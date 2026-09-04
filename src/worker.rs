@@ -574,6 +574,8 @@ pub(crate) fn process_print_job(
 
     println!("[DOWNLOAD] Saved: {}", pdf.path().display(),);
 
+    save_diagnostic_pdf(pdf.path(), "rbprinter-last-source.pdf");
+
     // ---------------------------------------------
     // PRINT
     // ---------------------------------------------
@@ -587,6 +589,8 @@ pub(crate) fn process_print_job(
     // Prepare a temporary receipt PDF using the current UI settings.
     // Width/margins are configurable; height remains dynamic per PDF.
     let prepared_pdf = prepare_receipt_pdf(pdf.path(), print_settings)?;
+
+    save_diagnostic_pdf(prepared_pdf.file.path(), "rbprinter-last-prepared.pdf");
 
     println!(
         "[PRINT] Prepared PDF: {}",
@@ -624,4 +628,24 @@ pub(crate) fn process_print_job(
     thread::sleep(Duration::from_secs(3));
 
     Ok(())
+}
+
+fn save_diagnostic_pdf(source: &Path, file_name: &str) {
+    let destination = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|directory| directory.join(file_name)));
+
+    let Some(destination) = destination else {
+        log_error("[DIAGNOSTIC] Unable to determine diagnostic PDF path");
+        return;
+    };
+
+    match fs::copy(source, &destination) {
+        Ok(_) => println!("[DIAGNOSTIC] Saved {}", destination.display()),
+        Err(err) => log_error(&format!(
+            "[DIAGNOSTIC] Unable to save {}: {}",
+            destination.display(),
+            err,
+        )),
+    }
 }
