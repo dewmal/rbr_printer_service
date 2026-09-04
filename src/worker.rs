@@ -598,6 +598,22 @@ pub(crate) fn process_print_job(
         print_settings.paper_width_mm, prepared_pdf.paper_height_mm,
     );
 
+    if print_settings.preview_before_print {
+        send_status(
+            ui_tx,
+            PrinterStatus::Printing,
+            "Preview open. Close SumatraPDF to continue printing...",
+        );
+
+        preview_pdf(prepared_pdf.file.path())?;
+
+        send_status(
+            ui_tx,
+            PrinterStatus::Printing,
+            "Preview closed. Sending PDF to default printer...",
+        );
+    }
+
     print_pdf(
         prepared_pdf.file.path(),
         prepared_pdf.paper_height_mm,

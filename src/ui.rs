@@ -60,6 +60,8 @@ pub(crate) struct PrinterApp {
 
     side_margin_mm: f64,
 
+    preview_before_print: bool,
+
     env_path: Option<PathBuf>,
 
     settings_message: String,
@@ -102,6 +104,8 @@ impl PrinterApp {
 
             side_margin_mm: initial_settings.side_margin_mm,
 
+            preview_before_print: initial_settings.preview_before_print,
+
             env_path: None,
 
             settings_message: String::new(),
@@ -143,6 +147,8 @@ impl PrinterApp {
                     self.paper_width_mm = settings.paper_width_mm;
 
                     self.side_margin_mm = settings.side_margin_mm;
+
+                    self.preview_before_print = settings.preview_before_print;
 
                     self.env_path = Some(env_path);
 
@@ -254,7 +260,15 @@ impl eframe::App for PrinterApp {
                                 .suffix(" mm"),
                         );
                         ui.end_row();
+
+                        ui.label("Before printing");
+                        ui.checkbox(&mut self.preview_before_print, "Open actual PDF preview");
+                        ui.end_row();
                     });
+
+                if self.preview_before_print {
+                    ui.small("Close the SumatraPDF preview window to continue printing.");
+                }
 
                 let content_width_mm = self.paper_width_mm - self.side_margin_mm;
                 ui.small(format!(
@@ -272,6 +286,7 @@ impl eframe::App for PrinterApp {
                         let settings = PrintSettings {
                             paper_width_mm: self.paper_width_mm,
                             side_margin_mm: self.side_margin_mm,
+                            preview_before_print: self.preview_before_print,
                         };
 
                         match settings.validate() {
@@ -291,6 +306,7 @@ impl eframe::App for PrinterApp {
                         let settings = PrintSettings {
                             paper_width_mm: self.paper_width_mm,
                             side_margin_mm: self.side_margin_mm,
+                            preview_before_print: self.preview_before_print,
                         };
 
                         match settings.validate() {
@@ -305,8 +321,10 @@ impl eframe::App for PrinterApp {
                                                 *current = settings;
                                             }
                                             self.settings_message = format!(
-                                                "Saved: {:.2} mm paper, {:.2} mm side margin",
-                                                settings.paper_width_mm, settings.side_margin_mm,
+                                                "Saved: {:.2} mm paper, {:.2} mm left margin, preview {}",
+                                                settings.paper_width_mm,
+                                                settings.side_margin_mm,
+                                                if settings.preview_before_print { "on" } else { "off" },
                                             );
                                         }
                                         Err(err) => {
@@ -325,6 +343,7 @@ impl eframe::App for PrinterApp {
                     if ui.button("Restore defaults").clicked() {
                         self.paper_width_mm = DEFAULT_PAPER_WIDTH_MM;
                         self.side_margin_mm = DEFAULT_SIDE_MARGIN_MM;
+                        self.preview_before_print = DEFAULT_PREVIEW_BEFORE_PRINT;
                     }
                 });
 
@@ -348,6 +367,7 @@ impl eframe::App for PrinterApp {
                 let settings = PrintSettings {
                     paper_width_mm: preview_paper_width_mm,
                     side_margin_mm: preview_side_margin_mm,
+                    preview_before_print: self.preview_before_print,
                 };
 
                 match settings.validate() {
@@ -442,7 +462,7 @@ impl eframe::App for PrinterApp {
 
                         ui.add_space(4.0);
                         ui.small(
-                            "Receipt height is calculated from each PDF. Content is reduced only when it is wider than the available area.",
+                            "Receipt height is calculated from each PDF. Content is fitted to the available width.",
                         );
                     }
                 }

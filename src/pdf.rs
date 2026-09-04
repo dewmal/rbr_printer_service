@@ -41,10 +41,12 @@ pub(crate) fn read_page_box(
     document: &Document,
     page_id: lopdf::ObjectId,
 ) -> Result<(f64, f64, f64, f64)> {
-    // CropBox and MediaBox may be inherited from the page tree.
-    // Prefer CropBox because it represents the visible page area.
-    let page_box_object = get_inherited_page_value(document, page_id, b"CropBox")
-        .or_else(|| get_inherited_page_value(document, page_id, b"MediaBox"))
+    // CropBox and MediaBox may be inherited from the page tree. Receipt PDFs
+    // from some generators have an incorrect CropBox that cuts through the
+    // first characters even though their drawing commands still exist. Use
+    // the full MediaBox so preparation can recover that content.
+    let page_box_object = get_inherited_page_value(document, page_id, b"MediaBox")
+        .or_else(|| get_inherited_page_value(document, page_id, b"CropBox"))
         .context("PDF page has no CropBox or MediaBox")?;
 
     let page_box = page_box_object
@@ -160,11 +162,13 @@ pub(crate) fn prepare_receipt_pdf(
             bail!("PDF page has invalid dimensions");
         }
 
-        // Uniformly scale only when necessary. The content is never enlarged.
-        // The configured margin is reserved only on the LEFT. The receipt uses
-        // all remaining width up to the right edge. Height follows the same
-        // uniform scale and therefore remains dynamic for every PDF.
-        let scale = (content_width_pt / source_width_pt).min(1.0);
+        // Fit every source page to the full configured content width. Some
+        // receipt generators emit a 58 mm PDF even when the job is printed on
+        // wider paper; refusing to enlarge those pages leaves a large blank
+        // strip on the right. Uniform scaling keeps the receipt proportions
+        // while making its page extend from the left margin to the right edge.
+        // Height follows the same scale and remains dynamic for every PDF.
+        let scale = content_width_pt / source_width_pt;
 
         let output_height_pt = source_height_pt * scale;
 

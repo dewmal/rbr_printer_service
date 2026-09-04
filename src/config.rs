@@ -8,6 +8,7 @@ use crate::*;
 pub(crate) struct PrintSettings {
     pub(crate) paper_width_mm: f64,
     pub(crate) side_margin_mm: f64,
+    pub(crate) preview_before_print: bool,
 }
 
 impl Default for PrintSettings {
@@ -15,6 +16,7 @@ impl Default for PrintSettings {
         Self {
             paper_width_mm: DEFAULT_PAPER_WIDTH_MM,
             side_margin_mm: DEFAULT_SIDE_MARGIN_MM,
+            preview_before_print: DEFAULT_PREVIEW_BEFORE_PRINT,
         }
     }
 }
@@ -131,9 +133,13 @@ pub(crate) fn load_config() -> Result<Config> {
 
     let side_margin_mm = read_env_f64(ENV_SIDE_MARGIN_MM, DEFAULT_SIDE_MARGIN_MM)?;
 
+    let preview_before_print =
+        read_env_bool(ENV_PREVIEW_BEFORE_PRINT, DEFAULT_PREVIEW_BEFORE_PRINT)?;
+
     let print_settings = PrintSettings {
         paper_width_mm,
         side_margin_mm,
+        preview_before_print,
     };
 
     print_settings.validate()?;
@@ -177,6 +183,19 @@ pub(crate) fn read_env_f64(key: &str, default_value: f64) -> Result<f64> {
         .with_context(|| format!("{key} must be a number, got '{value}'",))
 }
 
+pub(crate) fn read_env_bool(key: &str, default_value: bool) -> Result<bool> {
+    let value = match env::var(key) {
+        Ok(value) => value,
+        Err(_) => return Ok(default_value),
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" | "" => Ok(false),
+        value => bail!("{key} must be true or false, got '{value}'"),
+    }
+}
+
 pub(crate) fn save_print_settings_to_env(env_path: &Path, settings: PrintSettings) -> Result<()> {
     settings.validate()?;
 
@@ -195,6 +214,16 @@ pub(crate) fn save_print_settings_to_env(env_path: &Path, settings: PrintSetting
         &mut lines,
         ENV_SIDE_MARGIN_MM,
         &format!("{:.2}", settings.side_margin_mm,),
+    );
+
+    set_env_line(
+        &mut lines,
+        ENV_PREVIEW_BEFORE_PRINT,
+        if settings.preview_before_print {
+            "true"
+        } else {
+            "false"
+        },
     );
 
     let mut output = lines.join("\n");

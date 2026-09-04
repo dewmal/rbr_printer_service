@@ -39,10 +39,12 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 // Default thermal paper geometry. These can be edited in the UI and
 // are persisted in the .env file.
 const DEFAULT_PAPER_WIDTH_MM: f64 = 76.0;
-const DEFAULT_SIDE_MARGIN_MM: f64 = 2.5;
+const DEFAULT_SIDE_MARGIN_MM: f64 = 4.0;
+const DEFAULT_PREVIEW_BEFORE_PRINT: bool = false;
 
 const ENV_PAPER_WIDTH_MM: &str = "PAPER_WIDTH_MM";
 const ENV_SIDE_MARGIN_MM: &str = "SIDE_MARGIN_MM";
+const ENV_PREVIEW_BEFORE_PRINT: &str = "PREVIEW_BEFORE_PRINT";
 
 mod config;
 mod logging;

@@ -5,30 +5,60 @@ use crate::*;
 // =========================================================
 
 #[cfg(target_os = "windows")]
-pub(crate) fn print_pdf(path: &Path, paper_height_mm: f64, paper_width_mm: f64) -> Result<()> {
+fn sumatra_path() -> Result<PathBuf> {
     let exe_path = env::current_exe().context("Unable to determine application path")?;
-
     let exe_dir = exe_path
         .parent()
         .context("Unable to determine application directory")?;
-
     let sumatra = exe_dir.join("SumatraPDF.exe");
 
     if !sumatra.exists() {
         bail!("SumatraPDF.exe not found at {}", sumatra.display());
     }
 
+    Ok(sumatra)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn preview_pdf(path: &Path) -> Result<()> {
+    let sumatra = sumatra_path()?;
+
+    println!("[PREVIEW] Opening {}", path.display());
+
+    let status = Command::new(sumatra)
+        .arg("-new-window")
+        .arg("-esc-to-exit")
+        .arg(path)
+        .status()
+        .context("Unable to open SumatraPDF preview")?;
+
+    if !status.success() {
+        bail!("Preview failed. SumatraPDF exit code: {:?}", status.code());
+    }
+
+    println!("[PREVIEW] Closed; continuing to print");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn print_pdf(path: &Path, paper_height_mm: f64, paper_width_mm: f64) -> Result<()> {
+    let sumatra = sumatra_path()?;
+
     println!("[PRINT] PDF: {}", path.display());
     println!("[PRINT] Sending to Windows default printer");
 
-    // The prepared PDF already contains the configured left margin and
-    // final 76 mm page width. Pass only that exact geometry to Sumatra;
-    // do not ask Sumatra to center or rescale it again.
-    let print_settings = format!(
-        "noscale,paper={:.2}mm x {:.2}mm,disable-auto-rotation,ignore-pdf-print-settings",
+    // Let Sumatra select a form matching the prepared PDF's exact dynamic
+    // dimensions. Keep the prepared PDF at exact size so the driver does not
+    // vertically center it inside a longer default form and feed a large blank
+    // area first. Centering here is horizontal only; it moves the page away
+    // from the printer's clipped left origin without changing its top position.
+    let print_settings =
+        "noscale,center,paper=auto,bin=auto,disable-auto-rotation,ignore-pdf-print-settings";
+
+    println!(
+        "[PRINT] Requested paper: {:.2} mm x {:.2} mm",
         paper_width_mm, paper_height_mm,
     );
-
     println!("[PRINT] Settings: {}", print_settings,);
 
     let status = Command::new(&sumatra)
@@ -47,6 +77,11 @@ pub(crate) fn print_pdf(path: &Path, paper_height_mm: f64, paper_width_mm: f64) 
     println!("[PRINT] PDF submitted to default printer");
 
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn preview_pdf(_path: &Path) -> Result<()> {
+    bail!("Print preview is currently supported only on Windows")
 }
 
 // =========================================================
