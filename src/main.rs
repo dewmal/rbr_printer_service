@@ -65,7 +65,9 @@ impl Default for PrintSettings {
 
 impl PrintSettings {
     fn content_width_mm(&self) -> f64 {
-        self.paper_width_mm - (self.side_margin_mm * 2.0)
+        // The configured margin is a LEFT safety margin only.
+        // The remaining width on the right is fully available to the receipt.
+        self.paper_width_mm - self.side_margin_mm
     }
 
     fn validate(&self) -> Result<()> {
@@ -83,7 +85,7 @@ impl PrintSettings {
 
         if self.content_width_mm() <= 0.0 {
             bail!(
-                "Side margin is too large for a {:.2} mm paper width",
+                "Left margin is too large for a {:.2} mm paper width",
                 self.paper_width_mm,
             );
         }
@@ -555,7 +557,7 @@ impl eframe::App for PrinterApp {
                                 );
                                 ui.end_row();
 
-                                ui.label("Side margin");
+                                ui.label("Left margin");
                                 ui.add(
                                     egui::DragValue::new(
                                         &mut self.side_margin_mm,
@@ -569,7 +571,7 @@ impl eframe::App for PrinterApp {
 
                     let content_width_mm =
                         self.paper_width_mm
-                            - (self.side_margin_mm * 2.0);
+                            - self.side_margin_mm;
 
                     ui.small(
                         format!(
@@ -1118,7 +1120,7 @@ fn load_config() -> Result<Config> {
 
     log_info(
         &format!(
-            "[CONFIG] print layout = {:.2} mm paper / {:.2} mm margins / {:.2} mm content",
+            "[CONFIG] print layout = {:.2} mm paper / {:.2} mm left margin / {:.2} mm content",
             print_settings.paper_width_mm,
             print_settings.side_margin_mm,
             print_settings.content_width_mm(),
@@ -2275,6 +2277,9 @@ fn prepare_receipt_pdf(
     let paper_width_pt =
         settings.paper_width_mm * 72.0 / 25.4;
 
+    let left_margin_pt =
+        settings.side_margin_mm * 72.0 / 25.4;
+
     let content_width_pt =
         settings.content_width_mm() * 72.0 / 25.4;
 
@@ -2306,8 +2311,9 @@ fn prepare_receipt_pdf(
         }
 
         // Uniformly scale only when necessary. The content is never enlarged.
-        // The source is reduced only when needed to fit the configured side margins.
-        // Narrower receipts stay at 100% and are centered.
+        // The configured margin is reserved only on the LEFT. The receipt uses
+        // all remaining width up to the right edge. Height follows the same
+        // uniform scale and therefore remains dynamic for every PDF.
         let scale =
             (content_width_pt
                 / source_width_pt)
@@ -2324,12 +2330,10 @@ fn prepare_receipt_pdf(
         prepared_height_mm =
             output_height_pt * 25.4 / 72.0;
 
-        let actual_left_margin_pt =
-            (paper_width_pt - scaled_width_pt)
-                / 2.0;
-
+        // Place the scaled source at the configured LEFT margin.
+        // Do not center it; the remaining space is intentionally used on the right.
         let translate_x =
-            actual_left_margin_pt
+            left_margin_pt
                 - (x0 * scale);
 
         let translate_y =
@@ -2834,11 +2838,11 @@ fn print_pdf(
     println!("[PRINT] PDF: {}", path.display());
     println!("[PRINT] Sending to Windows default printer");
 
-    // The prepared PDF already contains the configured margins.
-    // Pass the configured width plus dynamic height to Sumatra so the
-    // thermal driver does not fall back to a fixed/long page size.
+    // The prepared PDF already contains the configured left margin and
+    // final 76 mm page width. Pass only that exact geometry to Sumatra;
+    // do not ask Sumatra to center or rescale it again.
     let print_settings = format!(
-        "noscale,center,paper={:.2}mm x {:.2}mm,disable-auto-rotation,ignore-pdf-print-settings",
+        "noscale,paper={:.2}mm x {:.2}mm,disable-auto-rotation,ignore-pdf-print-settings",
         paper_width_mm,
         paper_height_mm,
     );
